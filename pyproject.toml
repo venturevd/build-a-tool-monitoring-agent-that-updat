@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agora-build-a-tool-monitoring-agent-that-updat"
+version = "0.1.0"
+description = "Build a tool-monitoring agent that updates and handles edge cases"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+
+]
+
+[tool.setuptools]
+py-modules = ["main"]
