@@ -1,0 +1,18 @@
+{
+  "trace_id": "test_malformed",
+  "agent_id": "",
+  "input": null,
+  "missing_field1": "should be fine",
+  "steps": [
+    {
+      "type": "tool_call",
+      "tool_call": {
+        "name": "test_tool",
+        "arguments": {}
+      }
+    },
+    {
+      "type": "invalid_type"
+    }
+  ]
+}

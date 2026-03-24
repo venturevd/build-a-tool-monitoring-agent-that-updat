@@ -5,7 +5,13 @@ Tool Monitor — monitoring agent for tool execution health and edge cases.
 This agent monitors tools that agents build/run by analyzing ReasoningTraces.
 It detects edge cases, tracks tool health metrics, and can receive spec updates.
 
-Implements Agent Tool Interop Spec v0.1 primitives inline for self-containment.
+Features:
+- Track execution health metrics per tool
+- Detect common edge cases (timeouts, loops, errors, slow execution)
+- Identify failure patterns
+- Support for dynamic spec updates
+- Generate health reports with accurate status
+- Relaxed trace format validation (graceful handling of missing fields)
 """
 
 import argparse
@@ -63,7 +69,7 @@ class ToolCall:
 class ToolResult:
     """The result of a tool call."""
     call_id: str
-    output: Any
+    output: Any = None
     error: str | None = None
     duration_ms: int = 0
     cost_tokens: int = 0
@@ -175,47 +181,6 @@ class ReasoningTrace:
     metrics: TraceMetrics = field(default_factory=TraceMetrics)
     metadata: dict[str, Any] = field(default_factory=dict)
 
-    # Builder helpers
-    def add_reasoning(self, content: str, context_tokens: int = 0) -> TraceStep:
-        step = TraceStep(
-            type=StepType.REASONING,
-            content=content,
-            context_tokens=context_tokens,
-        )
-        self.steps.append(step)
-        self.metrics.step_count += 1
-        return step
-
-    def add_tool_call(self, call: ToolCall) -> TraceStep:
-        step = TraceStep(type=StepType.TOOL_CALL, tool_call=call)
-        self.steps.append(step)
-        self.metrics.step_count += 1
-        self.metrics.tool_call_count += 1
-        return step
-
-    def add_tool_result(self, result: ToolResult) -> TraceStep:
-        step = TraceStep(type=StepType.TOOL_RESULT, tool_result=result)
-        self.steps.append(step)
-        self.metrics.step_count += 1
-        if result.duration_ms:
-            self.metrics.total_duration_ms += result.duration_ms
-        return step
-
-    def finish(
-        self,
-        output: str,
-        status: TraceStatus = TraceStatus.SUCCESS,
-        total_tokens: int = 0,
-        total_cost_usd: float = 0.0,
-    ) -> None:
-        self.output = output
-        self.status = status
-        self.finished_at = datetime.now(timezone.utc)
-        if total_tokens:
-            self.metrics.total_tokens = total_tokens
-        if total_cost_usd:
-            self.metrics.total_cost_usd = total_cost_usd
-
     def to_dict(self) -> dict:
         return {
             "trace_id": self.trace_id,
@@ -233,51 +198,123 @@ class ReasoningTrace:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ReasoningTrace":
-        """Rebuild a trace from a dict (JSON deserialization)."""
+        """Rebuild a trace from a dict (JSON deserialization).
+
+        Gracefully handles missing or malformed fields with sensible defaults.
+        """
+        # Required fields with fallback defaults
+        agent_id = d.get("agent_id", "unknown_agent")
+        if not agent_id:
+            agent_id = "unknown_agent"
+
+        input_text = d.get("input", "")
+        if input_text is None:
+            input_text = ""
+
+        # Build trace with safe parsing
+        status_val = d.get("status", "in_progress")
+        try:
+            status = TraceStatus(status_val)
+        except ValueError:
+            # Invalid status - default to in_progress and note in metadata
+            status = TraceStatus.IN_PROGRESS
+            if "metadata" not in d or not isinstance(d.get("metadata"), dict):
+                d["metadata"] = {}
+            d["metadata"]["_invalid_status"] = status_val
+
         trace = cls(
             trace_id=d.get("trace_id", f"tr_{uuid.uuid4().hex[:6]}"),
-            agent_id=d["agent_id"],
-            input=d["input"],
+            agent_id=agent_id,
+            input=input_text,
             session_id=d.get("session_id"),
-            started_at=datetime.fromisoformat(d["started_at"]) if isinstance(d["started_at"], str) else d["started_at"],
-            status=TraceStatus(d.get("status", "in_progress")),
+            status=status,
             metadata=d.get("metadata", {}),
         )
 
-        if d.get("finished_at"):
-            trace.finished_at = datetime.fromisoformat(d["finished_at"]) if isinstance(d["finished_at"], str) else d["finished_at"]
+        # Parse started_at safely
+        started_at = d.get("started_at")
+        if started_at:
+            try:
+                if isinstance(started_at, str):
+                    trace.started_at = datetime.fromisoformat(started_at.replace('Z', '+00:00'))
+            except (ValueError, TypeError):
+                pass  # Use default
 
-        # deserialize steps
-        for step_dict in d.get("steps", []):
-            step_type = StepType(step_dict["type"])
-            step = TraceStep(type=step_type, step_id=step_dict.get("step_id", f"step_{uuid.uuid4().hex[:6]}"))
+        # Parse finished_at safely
+        finished_at = d.get("finished_at")
+        if finished_at:
+            try:
+                if isinstance(finished_at, str):
+                    trace.finished_at = datetime.fromisoformat(finished_at.replace('Z', '+00:00'))
+            except (ValueError, TypeError):
+                trace.finished_at = None
 
-            if isinstance(step_dict.get("timestamp"), str):
-                step.timestamp = datetime.fromisoformat(step_dict["timestamp"])
+        # Deserialize steps gracefully
+        steps_list = d.get("steps", [])
+        if not isinstance(steps_list, list):
+            steps_list = []
 
+        for step_dict in steps_list:
+            if not isinstance(step_dict, dict):
+                continue
+
+            step_type_val = step_dict.get("type")
+            if not step_type_val:
+                continue
+
+            try:
+                step_type = StepType(step_type_val)
+            except ValueError:
+                continue  # Skip unknown step types
+
+            step = TraceStep(
+                type=step_type,
+                step_id=step_dict.get("step_id", f"step_{uuid.uuid4().hex[:6]}")
+            )
+
+            # Parse timestamp safely
+            timestamp = step_dict.get("timestamp")
+            if timestamp:
+                try:
+                    if isinstance(timestamp, str):
+                        step.timestamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                except (ValueError, TypeError):
+                    pass  # Use default
+
+            # Parse step-specific fields based on type
             if step_type == StepType.REASONING:
                 step.content = step_dict.get("content")
                 step.context_tokens = step_dict.get("context_tokens", 0)
+                if not isinstance(step.context_tokens, int):
+                    step.context_tokens = 0
             elif step_type == StepType.TOOL_CALL:
                 call_dict = step_dict.get("tool_call", {})
-                step.tool_call = ToolCall(
-                    name=call_dict.get("name", ""),
-                    arguments=call_dict.get("arguments", {}),
-                    id=call_dict.get("id", f"call_{uuid.uuid4().hex[:8]}"),
-                )
+                if isinstance(call_dict, dict):
+                    step.tool_call = ToolCall(
+                        name=call_dict.get("name", ""),
+                        arguments=call_dict.get("arguments", {}),
+                        id=call_dict.get("id", f"call_{uuid.uuid4().hex[:8]}"),
+                    )
             elif step_type == StepType.TOOL_RESULT:
                 result_dict = step_dict.get("tool_result", {})
-                step.tool_result = ToolResult(
-                    call_id=result_dict.get("call_id", ""),
-                    output=result_dict.get("output"),
-                    error=result_dict.get("error"),
-                    duration_ms=result_dict.get("duration_ms", 0),
-                    cost_tokens=result_dict.get("cost_tokens", 0),
-                )
+                if isinstance(result_dict, dict):
+                    step.tool_result = ToolResult(
+                        call_id=result_dict.get("call_id", ""),
+                        output=result_dict.get("output"),
+                        error=result_dict.get("error"),
+                        duration_ms=result_dict.get("duration_ms", 0),
+                        cost_tokens=result_dict.get("cost_tokens", 0),
+                    )
+                    # Ensure duration_ms is an int
+                    if not isinstance(step.tool_result.duration_ms, int):
+                        try:
+                            step.tool_result.duration_ms = int(step.tool_result.duration_ms)
+                        except (ValueError, TypeError):
+                            step.tool_result.duration_ms = 0
 
             trace.steps.append(step)
 
-        # rebuild metrics
+        # Rebuild metrics from actual data
         total_dur = 0
         tool_calls = 0
         for step in trace.steps:
@@ -299,7 +336,7 @@ class ReasoningTrace:
 
     def has_loop(self, window: int = 3) -> bool:
         """Detect if the agent repeated the same tool call multiple times in a row."""
-        calls = [s.tool_call.name for s in self.steps if s.tool_call]
+        calls = [s.tool_call.name for s in self.steps if s.tool_call and s.tool_call.name]
         if len(calls) < window:
             return False
         for i in range(len(calls) - window + 1):
@@ -336,6 +373,28 @@ class ToolHealth:
             return 0.0
         return self.total_duration_ms / self.total_executions
 
+    def _assess_health(self) -> str:
+        """Assess overall tool health based on multiple factors."""
+        if self.total_executions == 0:
+            return "no_data"
+
+        # Check for critical edge cases first - they independently mark as unhealthy
+        critical_count = sum(
+            1 for ec in self.edge_cases_detected
+            if ec.get("severity") == "high"
+        )
+        if critical_count > 0:
+            return "unhealthy"
+
+        # Success rate based assessment
+        success_rate = self.success_rate
+        if success_rate >= 0.95:
+            return "healthy"
+        if success_rate >= 0.6:
+            return "degraded"
+
+        return "unhealthy"
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
@@ -354,16 +413,6 @@ class ToolHealth:
             "health_status": self._assess_health(),
         }
 
-    def _assess_health(self) -> str:
-        """Assess overall tool health."""
-        if self.total_executions == 0:
-            return "no_data"
-        if self.success_rate >= 0.95:
-            return "healthy"
-        if self.success_rate >= 0.8:
-            return "degraded"
-        return "unhealthy"
-
 
 class ToolMonitor:
     """
@@ -371,10 +420,11 @@ class ToolMonitor:
 
     Features:
     - Track execution health metrics per tool
-    - Detect common edge cases (timeouts, loops, errors)
+    - Detect common edge cases (timeouts, loops, errors, slow execution)
     - Identify failure patterns
     - Support for dynamic spec updates
-    - Generate health reports
+    - Generate health reports with accurate status
+    - Relaxed trace format validation (graceful handling of missing fields)
     """
 
     EDGE_CASE_THRESHOLDS = {
@@ -397,13 +447,20 @@ class ToolMonitor:
 
     def load_spec_from_file(self, filepath: Path) -> None:
         """Load tool specifications from a JSON file."""
-        with open(filepath) as f:
-            data = json.load(f)
-            if isinstance(data, dict):
-                for name, spec in data.items():
+        try:
+            with open(filepath) as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            print(f"Warning: Could not load specs from {filepath}: {e}", file=sys.stderr)
+            return
+
+        if isinstance(data, dict):
+            for name, spec in data.items():
+                if isinstance(spec, dict):
                     self.load_spec(name, spec)
-            elif isinstance(data, list):
-                for spec in data:
+        elif isinstance(data, list):
+            for spec in data:
+                if isinstance(spec, dict):
                     name = spec.get("name")
                     if name:
                         self.load_spec(name, spec)
@@ -439,12 +496,15 @@ class ToolMonitor:
             })
 
         # Analyze tool calls within trace
+        unknown_tools_detected: set[str] = set()
+
         for step in trace.steps:
             if step.type == StepType.TOOL_RESULT and step.tool_result:
                 result: ToolResult = step.tool_result
                 if result.error:
                     health.error_count += 1
-                    health.last_error = result.error
+                    if result.error:
+                        health.last_error = result.error
                     edge_cases.append({
                         "type": "tool_error",
                         "tool": tool_name,
@@ -460,19 +520,32 @@ class ToolMonitor:
                         "tool": tool_name,
                         "duration_ms": result.duration_ms,
                         "threshold_ms": self.EDGE_CASE_THRESHOLDS["duration_critical_ms"],
-                        "severity": "medium" if result.duration_ms < self.EDGE_CASE_THRESHOLDS["duration_warning_ms"] else "high",
+                        "severity": "high" if result.duration_ms >= self.EDGE_CASE_THRESHOLDS["duration_critical_ms"] else "medium",
+                    })
+                elif result.duration_ms and result.duration_ms > self.EDGE_CASE_THRESHOLDS["duration_warning_ms"]:
+                    edge_cases.append({
+                        "type": "slow_execution",
+                        "tool": tool_name,
+                        "duration_ms": result.duration_ms,
+                        "threshold_ms": self.EDGE_CASE_THRESHOLDS["duration_warning_ms"],
+                        "severity": "medium",
                     })
 
             if step.type == StepType.TOOL_CALL and step.tool_call:
                 call = step.tool_call
                 if call.name not in self.specs:
-                    edge_cases.append({
-                        "type": "unknown_tool",
-                        "tool": call.name,
-                        "trace_id": trace.trace_id,
-                        "message": f"Tool '{call.name}' not in loaded specs",
-                        "severity": "low",
-                    })
+                    unknown_tools_detected.add(call.name)
+
+        # Report unknown tools (one edge case per unknown tool)
+        for unknown_tool in unknown_tools_detected:
+            edge_cases.append({
+                "type": "unknown_tool",
+                "tool": tool_name,
+                "missing_tool": unknown_tool,
+                "trace_id": trace.trace_id,
+                "message": f"Tool '{unknown_tool}' not in loaded specs",
+                "severity": "low",
+            })
 
         # Check for loops
         if trace.has_loop(window=self.EDGE_CASE_THRESHOLDS["loop_detection_window"]):
@@ -485,23 +558,33 @@ class ToolMonitor:
                 "severity": "high",
             })
 
-        # Track duration
+        # Track duration (sum of all tool result durations)
         if trace.metrics.total_duration_ms:
             health.total_duration_ms += trace.metrics.total_duration_ms
 
         # Record edge cases
         health.edge_cases_detected.extend(edge_cases)
 
-        # Assess if successful
+        # Assess if successful - only count as success if trace status is SUCCESS
+        # and no high-severity edge cases from this trace
         if trace.status == TraceStatus.SUCCESS:
-            health.success_count += 1
+            has_critical_error = any(
+                ec.get("severity") == "high" for ec in edge_cases
+            )
+            if not has_critical_error:
+                health.success_count += 1
 
         return edge_cases
 
     def process_trace_file(self, filepath: Path) -> list[dict[str, Any]]:
         """Process a trace from a JSON file."""
-        with open(filepath) as f:
-            data = json.load(f)
+        try:
+            with open(filepath) as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            print(f"Error reading trace file {filepath}: {e}", file=sys.stderr)
+            return []
+
         trace = ReasoningTrace.from_dict(data)
         return self.process_trace(trace)
 
@@ -516,19 +599,22 @@ class ToolMonitor:
                 "healthy_tools": 0,
                 "degraded_tools": 0,
                 "unhealthy_tools": 0,
-                "critical_edge_cases": 0,
+                "no_data_tools": 0,
             }
         }
 
         for name, health in sorted(self.tools.items(), key=lambda x: x[1].total_executions, reverse=True):
             health_dict = health.to_dict()
             report["tools"][name] = health_dict
-            if health_dict["health_status"] == "healthy":
+            status = health_dict["health_status"]
+            if status == "healthy":
                 report["summary"]["healthy_tools"] += 1
-            elif health_dict["health_status"] == "degraded":
+            elif status == "degraded":
                 report["summary"]["degraded_tools"] += 1
-            else:
+            elif status == "unhealthy":
                 report["summary"]["unhealthy_tools"] += 1
+            else:
+                report["summary"]["no_data_tools"] += 1
 
         return report
 
@@ -548,7 +634,7 @@ class ToolMonitor:
             "total_edge_cases": len(all_edge_cases),
             "by_type": by_type,
             "by_severity": by_severity,
-            "critical_cases": [c for c in all_edge_cases if c["severity"] == "high"],
+            "critical_cases": [c for c in all_edge_cases if c.get("severity") == "high"],
         }
 
     def suggest_spec_updates(self) -> list[dict[str, Any]]:
@@ -581,6 +667,30 @@ class ToolMonitor:
                         "suggestion": "Consider adding timeout parameters or async processing",
                     })
 
+                # Check for loop patterns
+                if health.loop_count > 0:
+                    loop_rate = health.loop_count / health.total_executions
+                    if loop_rate > 0.1:
+                        suggestions.append({
+                            "tool": name,
+                            "priority": "high",
+                            "issue": f"Loop detection rate: {loop_rate:.1%}",
+                            "suggestion": "Review tool usage pattern; agent may need guardrails",
+                        })
+
+                # Unknown tool references (from this tool's traces)
+                unknown_tool_count = sum(
+                    1 for ec in health.edge_cases_detected
+                    if ec.get("type") == "unknown_tool"
+                )
+                if unknown_tool_count > 0:
+                    suggestions.append({
+                        "tool": name,
+                        "priority": "medium",
+                        "issue": f"Calls to {unknown_tool_count} unknown tool(s)",
+                        "suggestion": "Ensure all tool specs are loaded or add missing tool definitions",
+                    })
+
         return suggestions
 
 
@@ -593,14 +703,17 @@ Examples:
   # Monitor a directory of traces
   python3 main.py monitor traces/
 
+  # Monitor a single trace file
+  python3 main.py monitor trace.json
+
   # Load tool specs and generate health report
   python3 main.py --specs tools.json report
 
-  # Interactive monitoring (read traces from stdin)
-  python3 main.py --specs tools.json monitor-stdin
-
   # Suggest spec updates based on patterns
   python3 main.py --specs tools.json suggest-updates
+
+  # Run simulation (demo mode)
+  python3 main.py simulate
         """
     )
 
@@ -626,13 +739,13 @@ Examples:
     # Report command
     report_parser = subparsers.add_parser(
         "report",
-        help="Generate health report (requires --specs)"
+        help="Generate health report"
     )
 
     # Suggest updates command
     suggest_parser = subparsers.add_parser(
         "suggest-updates",
-        help="Suggest spec updates based on detected patterns (requires --specs)"
+        help="Suggest spec updates based on detected patterns"
     )
 
     # Simulate command for testing
@@ -647,9 +760,14 @@ Examples:
     monitor = ToolMonitor()
 
     # Load specs if provided
-    if args.specs and args.specs.exists():
-        print(f"Loading specs from {args.specs}", file=sys.stderr)
-        monitor.load_spec_from_file(args.specs)
+    if args.specs:
+        if args.specs.exists():
+            print(f"Loading specs from {args.specs}", file=sys.stderr)
+            monitor.load_spec_from_file(args.specs)
+        else:
+            print(f"Warning: Specs file not found: {args.specs}", file=sys.stderr)
+            print("Using built-in sample specs for demonstration", file=sys.stderr)
+            _load_sample_specs(monitor)
     else:
         # Load built-in sample specs for demonstration
         _load_sample_specs(monitor)
@@ -706,7 +824,11 @@ def _cmd_monitor(monitor: ToolMonitor, path: Path) -> None:
     if path.is_file():
         trace_files = [path]
     else:
+        # Support both .json and no extension
         trace_files = sorted(path.glob("*.json"))
+        if not trace_files:
+            # Try all files in directory
+            trace_files = [p for p in path.iterdir() if p.is_file()]
 
     if not trace_files:
         print(f"No trace JSON files found in {path}", file=sys.stderr)
@@ -728,7 +850,8 @@ def _cmd_monitor(monitor: ToolMonitor, path: Path) -> None:
     if all_edge_cases:
         print("\nTop edge cases:", file=sys.stderr)
         for case in all_edge_cases[:5]:
-            print(f"  - [{case['severity']}] {case['type']}: {case.get('message', case.get('error', 'unknown'))}", file=sys.stderr)
+            msg = case.get('message', case.get('error', 'unknown'))
+            print(f"  - [{case['severity']}] {case['type']}: {msg}", file=sys.stderr)
 
     # Generate report
     report = monitor.get_health_report()
@@ -774,7 +897,6 @@ def _cmd_simulate(monitor: ToolMonitor) -> None:
                         "call_id": "call_001",
                         "output": ["result1", "result2"],
                         "duration_ms": 500,
-                        "success": True,
                     },
                     "timestamp": "2025-01-01T12:00:01Z",
                 },
@@ -862,6 +984,78 @@ def _cmd_simulate(monitor: ToolMonitor) -> None:
                         "timestamp": "2025-01-01T12:03:00Z",
                     },
                     "timestamp": "2025-01-01T12:03:00Z",
+                },
+            ],
+        },
+        {
+            "trace_id": "sim_005",
+            "agent_id": "loop_tool",
+            "input": "test loop detection",
+            "status": "success",
+            "started_at": "2025-01-01T12:04:00Z",
+            "steps": [
+                {
+                    "step_id": "l1",
+                    "type": "tool_call",
+                    "tool_call": {
+                        "id": "call_005",
+                        "name": "recurring_tool",
+                        "arguments": {"n": 1},
+                        "timestamp": "2025-01-01T12:04:00Z",
+                    },
+                    "timestamp": "2025-01-01T12:04:00Z",
+                },
+                {
+                    "step_id": "l2",
+                    "type": "tool_result",
+                    "tool_result": {
+                        "call_id": "call_005",
+                        "output": "ok",
+                        "duration_ms": 100,
+                    },
+                    "timestamp": "2025-01-01T12:04:00.5Z",
+                },
+                {
+                    "step_id": "l3",
+                    "type": "tool_call",
+                    "tool_call": {
+                        "id": "call_006",
+                        "name": "recurring_tool",
+                        "arguments": {"n": 2},
+                        "timestamp": "2025-01-01T12:04:00.6Z",
+                    },
+                    "timestamp": "2025-01-01T12:04:00.6Z",
+                },
+                {
+                    "step_id": "l4",
+                    "type": "tool_result",
+                    "tool_result": {
+                        "call_id": "call_006",
+                        "output": "ok",
+                        "duration_ms": 100,
+                    },
+                    "timestamp": "2025-01-01T12:04:01Z",
+                },
+                {
+                    "step_id": "l5",
+                    "type": "tool_call",
+                    "tool_call": {
+                        "id": "call_007",
+                        "name": "recurring_tool",
+                        "arguments": {"n": 3},
+                        "timestamp": "2025-01-01T12:04:01.1Z",
+                    },
+                    "timestamp": "2025-01-01T12:04:01.1Z",
+                },
+                {
+                    "step_id": "l6",
+                    "type": "tool_result",
+                    "tool_result": {
+                        "call_id": "call_007",
+                        "output": "ok",
+                        "duration_ms": 100,
+                    },
+                    "timestamp": "2025-01-01T12:04:01.5Z",
                 },
             ],
         },
